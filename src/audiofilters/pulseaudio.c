@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2010-2019 Belledonne Communications SARL.
+ * Copyright (c) 2019 Rangee GmbH.
  *
  * This file is part of mediastreamer2.
  *
@@ -15,16 +16,42 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ * The code for expanding "MSSndCardDesc" was inspiered by
+ * https://wiki.tcl-lang.org/page/Linux%3A+volume+control part "pulseaudio.c"
  */
 
 #include "mediastreamer2/msfilter.h"
 #include "mediastreamer2/mssndcard.h"
 #include "mediastreamer2/msticker.h"
 #include "mediastreamer2/msinterfaces.h"
+#include <math.h>
 
 #include <pulse/pulseaudio.h>
 
 #define PA_STRING_SIZE 256
+
+typedef struct {
+    char      *defname;
+    void      *tcldata;
+} getSourceData_t;
+
+typedef union {
+    char            *defname;
+    pa_cvolume      *vol;
+    getSourceData_t *sourcedata;
+} callback_t_2;
+
+typedef struct {
+    char      *defname;
+    void      *tcldata;
+} getSinkData_t;
+
+typedef union {
+    char            *defname;
+    pa_cvolume      *vol;
+    getSinkData_t   *sinkdata;
+} callback_t;
 
 typedef struct pa_device {
 	char name[PA_STRING_SIZE];
@@ -123,6 +150,33 @@ static void pulse_card_unload(MSSndCardManager *m) {
 static void pulse_card_detect(MSSndCardManager *m);
 static MSFilter *pulse_card_create_reader(MSSndCard *card);
 static MSFilter *pulse_card_create_writer(MSSndCard *card);
+static void pulse_card_set_volume_level(MSSndCard *obj, MSSndCardMixerElem e, int a);
+static int pulse_card_get_volume_level(MSSndCard *obj,MSSndCardMixerElem e);
+void sinkVolCallback (pa_context *context, const pa_sink_info *i, int eol, void *userdata);
+
+void sinkVolCallback (pa_context *context, const pa_sink_info *i, int eol, void *userdata)
+{
+    callback_t    *cbdata = (callback_t *) userdata;
+    if (eol != 0) {
+        pa_threaded_mainloop_signal (the_pa_loop, 0);
+        return;
+    }
+    memcpy (cbdata->vol, &(i->volume), sizeof (pa_cvolume));
+    pa_threaded_mainloop_signal(the_pa_loop, 0);;
+}
+
+void sourceVolCallback (pa_context *context, const pa_source_info *i, int eol, void *userdata);
+
+void sourceVolCallback (pa_context *context, const pa_source_info *i, int eol, void *userdata)
+{
+    callback_t_2    *cbdata = (callback_t_2 *) userdata;
+    if (eol != 0) {
+        pa_threaded_mainloop_signal (the_pa_loop, 0);
+        return;
+    }
+    memcpy (cbdata->vol, &(i->volume), sizeof (pa_cvolume));
+    pa_threaded_mainloop_signal(the_pa_loop, 0);;
+}
 
 static void pulse_card_init(MSSndCard *card){
 	PAData *card_data=ms_new0(PAData,1);
@@ -140,6 +194,8 @@ MSSndCardDesc pulse_card_desc={
 	.driver_type="PulseAudio",
 	.detect=pulse_card_detect,
 	.init=pulse_card_init,
+	.set_level=pulse_card_set_volume_level,
+	.get_level=pulse_card_get_volume_level,
 	.create_reader=pulse_card_create_reader,
 	.create_writer=pulse_card_create_writer,
 	.uninit=pulse_card_uninit,
@@ -486,10 +542,199 @@ static void stream_disconnect(Stream *s) {
 	}
 }
 
-
 static void stream_set_volume_cb(pa_context *c, int success, void *user_data) {
 	*(int *)user_data = success;
 	pa_threaded_mainloop_signal(the_pa_loop, FALSE);
+}
+
+void nullCallback (pa_context* context, int success, void* userdata)
+{
+    callback_t    *cbdata = (callback_t *) userdata;
+    printf("%s", cbdata->defname);
+    pa_threaded_mainloop_signal (the_pa_loop, 0);
+}
+
+static int card_get_source_volume(MSSndCard *obj) {
+    PAData *card_data;
+    card_data = (PAData*)obj->data;
+    pa_operation *op;
+    callback_t cbdata;
+    pa_cvolume      pavol;
+    pa_volume_t avgvol;
+    pa_cvolume_init(&pavol);
+    cbdata.vol = &pavol;
+
+    pa_threaded_mainloop_lock(the_pa_loop);
+    op = pa_context_get_source_info_by_name(the_pa_context, card_data->pa_id_source, sourceVolCallback, &cbdata);
+    while(pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+        pa_threaded_mainloop_wait(the_pa_loop);
+    }
+    pa_threaded_mainloop_unlock(the_pa_loop);
+    pa_operation_unref(op);
+
+    avgvol = pa_cvolume_avg (&pavol);
+
+    double norm;
+    norm = PA_VOLUME_NORM;
+    int inorm;
+    inorm = (int) norm;
+    int erg;
+    // volume range from 0% to PA_VOLUME_NORM (100%)
+    erg = (int) round ((double) avgvol / inorm * 100.0);
+    return erg;
+}
+
+static uint32_t card_get_source_channels(PAData *card_data, callback_t cbdata){
+    // Gets the number of channels from sink
+    pa_operation *op;
+    pa_threaded_mainloop_lock(the_pa_loop);
+    op = pa_context_get_source_info_by_name(the_pa_context, card_data->pa_id_source, sourceVolCallback, &cbdata);
+    while(pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+        pa_threaded_mainloop_wait(the_pa_loop);
+    }
+    pa_threaded_mainloop_unlock(the_pa_loop);
+    pa_operation_unref(op);
+
+    return cbdata.vol->channels;
+}
+
+static void card_set_source_volume(int a, MSSndCard *obj) {
+    PAData *card_data;
+    card_data = (PAData*)obj->data;
+    pa_operation *op;
+    callback_t cbdata;
+    pa_cvolume      pavol;
+    pa_cvolume_init(&pavol);
+    cbdata.vol = &pavol;
+
+    double norm;
+    norm = PA_VOLUME_NORM;
+    int inorm;
+    inorm = (int) norm;
+
+    // volume range from 0% to PA_VOLUME_NORM (100%)
+    a = (a * (inorm - 0) / 100) + 0;
+
+    // if the user will set a volume above 100% it will be set to 100%
+    if (a > inorm){
+        a = inorm;
+    }
+    pa_cvolume  *nvol;
+    nvol = pa_cvolume_set(&pavol,card_get_source_channels(card_data, cbdata), a);
+    pa_threaded_mainloop_lock(the_pa_loop);
+    op = pa_context_set_source_volume_by_name(the_pa_context, card_data->pa_id_source, nvol,nullCallback, &cbdata);
+    while(pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+        pa_threaded_mainloop_wait(the_pa_loop);
+    }
+    pa_threaded_mainloop_unlock(the_pa_loop);
+    pa_operation_unref(op);
+}
+
+static int card_get_sink_volume(MSSndCard *obj) {
+    PAData *card_data;
+    card_data = (PAData*)obj->data;
+    pa_operation *op;
+    callback_t cbdata;
+    pa_cvolume      pavol;
+    pa_volume_t avgvol;
+    pa_cvolume_init(&pavol);
+    cbdata.vol = &pavol;
+
+    pa_threaded_mainloop_lock(the_pa_loop);
+    op = pa_context_get_sink_info_by_name(the_pa_context, card_data->pa_id_sink, sinkVolCallback, &cbdata);
+    while(pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+        pa_threaded_mainloop_wait(the_pa_loop);
+    }
+    pa_threaded_mainloop_unlock(the_pa_loop);
+    pa_operation_unref(op);
+
+    avgvol = pa_cvolume_avg (&pavol);
+
+    double norm;
+    norm = PA_VOLUME_NORM;
+    int inorm;
+    inorm = (int) norm;
+    int erg;
+    // volume range from 0% to PA_VOLUME_NORM (100%)
+    erg = (int) round ((double) avgvol / inorm * 100.0);
+    return erg;
+}
+
+static uint32_t card_get_sink_channels(PAData *card_data, callback_t cbdata){
+    // Gets the number of channels from sink
+    pa_operation *op;
+    pa_threaded_mainloop_lock(the_pa_loop);
+    op = pa_context_get_sink_info_by_name(the_pa_context, card_data->pa_id_sink, sinkVolCallback, &cbdata);
+    while(pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+        pa_threaded_mainloop_wait(the_pa_loop);
+    }
+    pa_threaded_mainloop_unlock(the_pa_loop);
+    pa_operation_unref(op);
+
+    return cbdata.vol->channels;
+}
+
+static void card_set_sink_volume(int a, MSSndCard *obj) {
+    PAData *card_data;
+    card_data = (PAData*)obj->data;
+    pa_operation *op;
+    callback_t cbdata;
+    pa_cvolume      pavol;
+    pa_cvolume_init(&pavol);
+    cbdata.vol = &pavol;
+
+    double norm;
+    norm = PA_VOLUME_NORM;
+    int inorm;
+    inorm = (int) norm;
+
+    // volume range from 0% to PA_VOLUME_NORM (100%)
+    a = (a * (inorm - 0) / 100) + 0;
+
+    // if the user will set a volume above 100% it will be set to 100%
+    if (a > inorm){
+        a = inorm;
+    }
+    pa_cvolume  *nvol;
+    nvol = pa_cvolume_set(&pavol,card_get_sink_channels(card_data, cbdata), a);
+    pa_threaded_mainloop_lock(the_pa_loop);
+    op = pa_context_set_sink_volume_by_name(the_pa_context, card_data->pa_id_sink, nvol,nullCallback, &cbdata);
+    while(pa_operation_get_state(op) == PA_OPERATION_RUNNING) {
+        pa_threaded_mainloop_wait(the_pa_loop);
+    }
+    pa_threaded_mainloop_unlock(the_pa_loop);
+    pa_operation_unref(op);
+}
+
+static int pulse_card_get_volume_level(MSSndCard *obj,MSSndCardMixerElem e)
+{
+    int erg = -1;
+    switch(e){
+        case MS_SND_CARD_CAPTURE:
+            erg = card_get_source_volume(obj);
+            break;
+        case MS_SND_CARD_PLAYBACK:
+            erg = card_get_sink_volume(obj);
+            break;
+        default:
+            ms_warning("alsa_card_set_level: unsupported command.");
+    }
+    return erg;
+}
+
+
+static void pulse_card_set_volume_level(MSSndCard *obj,MSSndCardMixerElem e,int a)
+{
+    switch(e){
+        case MS_SND_CARD_CAPTURE:
+            card_set_source_volume(a, obj);
+            break;
+        case MS_SND_CARD_PLAYBACK:
+            card_set_sink_volume(a, obj);
+            break;
+        default:
+            ms_warning("alsa_card_set_level: unsupported command.");
+    }
 }
 
 static bool_t stream_set_volume(Stream *s, double volume) {
@@ -532,10 +777,10 @@ static void stream_get_source_volume_cb(pa_context *c, const pa_source_output_in
 }
 
 static void stream_get_sink_volume_cb(pa_context *c, const pa_sink_input_info *i, int eol, void *user_data) {
-	if(i) {
-		*(double *)user_data = volume_to_scale(pa_cvolume_avg(&i->volume));
-	}
-	pa_threaded_mainloop_signal(the_pa_loop, FALSE);
+    if(i) {
+        *(double *)user_data = volume_to_scale(pa_cvolume_avg(&i->volume));
+    }
+    pa_threaded_mainloop_signal(the_pa_loop, FALSE);
 }
 
 static bool_t stream_get_volume(Stream *s, double *volume) {
